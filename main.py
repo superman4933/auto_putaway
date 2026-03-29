@@ -188,6 +188,45 @@ def product_folder_name(name: str, product_id: str) -> str:
     return out
 
 
+def make_unique_product_dir(
+    root_dir: Path,
+    name: str,
+    product_id: str,
+    on_log: OnLog,
+    idx: int,
+    total: int,
+) -> Path | None:
+    """在 root_dir 下创建商品文件夹；若与已有目录重名则自动追加 _2、_3 …"""
+    base_folder = product_folder_name(name or "_", product_id)
+    folder = base_folder
+    counter = 1
+    max_attempts = 10_000
+
+    while True:
+        product_dir = root_dir / folder
+        try:
+            product_dir.mkdir(parents=False, exist_ok=False)
+            if folder != base_folder:
+                on_log(f"[{idx}/{total}] 文件夹名与已有记录冲突，已改用：{folder}")
+            return product_dir
+        except FileExistsError:
+            counter += 1
+            if counter > max_attempts:
+                on_log(
+                    f"[{idx}/{total}] 跳过：无法为「{base_folder}」分配唯一文件夹（已达 {max_attempts} 次）。"
+                )
+                return None
+            suffix = f"_{counter}"
+            max_base = MAX_PRODUCT_FOLDER_LEN - len(suffix)
+            if max_base < 1:
+                max_base = 1
+            trimmed = base_folder[:max_base].rstrip("._ ") or "_"
+            folder = trimmed + suffix
+        except OSError as e:
+            on_log(f"[{idx}/{total}] 跳过：无法创建文件夹 {folder} — {e}")
+            return None
+
+
 def root_material_folder_name(csv_stem: str) -> str:
     stem = sanitize_component(csv_stem, MAX_STEM_SANITIZE)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -510,16 +549,10 @@ def run_job(
         name = (row.get("商品名称") or "").strip()
         pid = (row.get("商品ID") or "").strip()
 
-        folder = product_folder_name(name or "_", pid)
-        product_dir = root_dir / folder
-        try:
-            product_dir.mkdir(parents=False, exist_ok=False)
-        except FileExistsError:
-            on_log(f"[{idx}/{total}] 跳过：文件夹已存在 {folder}")
+        product_dir = make_unique_product_dir(root_dir, name, pid, on_log, idx, total)
+        if product_dir is None:
             continue
-        except OSError as e:
-            on_log(f"[{idx}/{total}] 跳过：无法创建文件夹 {folder} — {e}")
-            continue
+        folder = product_dir.name
 
         sub_main = product_dir / "主图"
         sub_sku = product_dir / "SKU图"
@@ -828,7 +861,7 @@ class MainWindow(QMainWindow):
             self.append_log(f"任务结束：{msg}")
 
             box = QMessageBox(self)
-            box.setWindowTitle("完成")
+            box.setWindowTitle("打开文件夹")
             box.setIcon(QMessageBox.Information)
             box.setText("已完成所有处理。")
             box.setStandardButtons(QMessageBox.Ok)
