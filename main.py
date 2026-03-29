@@ -91,7 +91,7 @@ class MainWindow(QMainWindow):
         root.addWidget(file_group)
 
         stat_layout = QHBoxLayout()
-        self.lbl_pending = QLabel("待处理：— 条（商品ID 非空）")
+        self.lbl_pending = QLabel("待处理：— 条（商品ID 非空且含 SKU）")
         self.lbl_progress = QLabel("当前处理：—")
         stat_layout.addWidget(self.lbl_pending)
         stat_layout.addStretch(1)
@@ -161,16 +161,16 @@ class MainWindow(QMainWindow):
 
     def _refresh_pending_count(self) -> None:
         self._total_rows = None
-        self.lbl_pending.setText("待处理：— 条（商品ID 非空）")
+        self.lbl_pending.setText("待处理：— 条（商品ID 非空且含 SKU）")
         self.lbl_progress.setText("当前处理：—")
         if self._csv_path is None or not self._csv_path.is_file():
             return
-        self.lbl_pending.setText("待处理：统计中…（商品ID 非空）")
+        self.lbl_pending.setText("待处理：统计中…（商品ID 非空且含 SKU）")
         QApplication.processEvents()
         n, err = get_csv_data_row_count(self._csv_path)
         if n is not None:
             self._total_rows = n
-            self.lbl_pending.setText(f"待处理：{n} 条（商品ID 非空）")
+            self.lbl_pending.setText(f"待处理：{n} 条（商品ID 非空且含 SKU）")
         else:
             self.lbl_pending.setText(f"待处理：无法统计（{err or '未知错误'}）")
 

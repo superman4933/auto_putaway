@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import threading
 from datetime import datetime
@@ -10,7 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 from charset_normalizer import from_bytes
-from openpyxl import Workbook
+from openpyxl import load_workbook
 
 OnLog = Callable[[str], None]
 OnProgress = Callable[[int, int], None]
@@ -100,23 +101,6 @@ def load_csv_with_encoding_detection(
     raise ValueError(f"无法用已知编码解码 CSV。尝试摘要: {detail}")
 
 
-def row_has_product_id(row: dict[str, str]) -> bool:
-    return bool((row.get("商品ID") or "").strip())
-
-
-def get_csv_data_row_count(csv_path: Path) -> tuple[int | None, str | None]:
-    """统计有效数据行数：商品ID 非空（strip 后），不含表头。失败返回 (None, 错误说明)。"""
-    p = csv_path.resolve()
-    if not p.is_file():
-        return None, "文件不存在。"
-    try:
-        headers, rows, _enc = load_csv_with_encoding_detection(p, None)
-    except ValueError as e:
-        return None, str(e)
-    if "商品ID" not in headers or "商品名称" not in headers:
-        return None, "CSV 缺少必需列：商品ID 或 商品名称。"
-    return sum(1 for r in rows if row_has_product_id(r)), None
-
 WIN_ILLEGAL = r'<>:"/\\|?*'
 WIN_ILLEGAL_SET = set(WIN_ILLEGAL)
 
@@ -202,6 +186,115 @@ def split_pipe_field(value: str | None) -> list[str]:
     return [p for p in parts if p]
 
 
+def row_has_product_id(row: dict[str, str]) -> bool:
+    return bool((row.get("商品ID") or "").strip())
+
+
+def row_has_skus(row: dict[str, str]) -> bool:
+    return len(split_pipe_field(row.get("SKU属性"))) > 0
+
+
+def get_csv_data_row_count(csv_path: Path) -> tuple[int | None, str | None]:
+    """统计有效数据行数：商品ID 非空且 SKU属性 至少有一段；不含表头。"""
+    p = csv_path.resolve()
+    if not p.is_file():
+        return None, "文件不存在。"
+    try:
+        headers, rows, _enc = load_csv_with_encoding_detection(p, None)
+    except ValueError as e:
+        return None, str(e)
+    if "商品ID" not in headers or "商品名称" not in headers:
+        return None, "CSV 缺少必需列：商品ID 或 商品名称。"
+    return sum(1 for r in rows if row_has_product_id(r) and row_has_skus(r)), None
+
+
+PRODUCT_INFO_TEMPLATE = "商品信息.xlsx"
+
+TPL_COL_TITLE = 1
+TPL_COL_HUOHAO = 2
+TPL_COL_ATTR = 3
+TPL_COL_CATEGORY = 4
+TPL_COL_BRAND = 5
+TPL_COL_SPEC1 = 6
+TPL_COL_PRICE = 8
+TPL_COL_STOCK = 9
+TPL_COL_SKU_BARCODE = 12
+
+
+def product_info_template_path() -> Path:
+    return Path(__file__).resolve().parent / PRODUCT_INFO_TEMPLATE
+
+
+def format_product_attr_cell(raw: str | None) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        return s
+    if not isinstance(obj, dict):
+        return s
+    parts = [f"{k}: {str(v)}" for k, v in obj.items()]
+    return ", ".join(parts)
+
+
+def _maybe_excel_number(s: str) -> str | int | float:
+    t = (s or "").strip()
+    if not t:
+        return ""
+    try:
+        if "." in t:
+            return float(t)
+        return int(t)
+    except ValueError:
+        return t
+
+
+def write_product_xlsx_from_template(template_path: Path, dest: Path, row: dict[str, str]) -> None:
+    wb = load_workbook(template_path)
+    ws = wb.active
+    first_data_row = 3
+    if ws.max_row >= first_data_row:
+        ws.delete_rows(first_data_row, ws.max_row - first_data_row + 1)
+
+    skus = split_pipe_field(row.get("SKU属性"))
+    prices = split_pipe_field(row.get("SKU价格"))
+    stocks = split_pipe_field(row.get("SKU库存"))
+    barcodes = split_pipe_field(row.get("SKU条形码"))
+
+    title = (row.get("商品名称") or "").strip()
+    huohao = (row.get("商品ID") or "").strip()
+    attr_text = format_product_attr_cell(row.get("商品属性"))
+    category = (row.get("店铺分类") or "").strip()
+    brand = "无"
+
+    n = len(skus)
+    for i in range(n):
+        r = first_data_row + i
+        spec = skus[i]
+        price_s = prices[i] if i < len(prices) else ""
+        stock_s = stocks[i] if i < len(stocks) else ""
+        bc_s = barcodes[i] if i < len(barcodes) else ""
+
+        if i == 0:
+            ws.cell(row=r, column=TPL_COL_TITLE, value=title)
+            ws.cell(row=r, column=TPL_COL_HUOHAO, value=huohao)
+            ws.cell(row=r, column=TPL_COL_ATTR, value=attr_text)
+            ws.cell(row=r, column=TPL_COL_CATEGORY, value=category)
+            ws.cell(row=r, column=TPL_COL_BRAND, value=brand)
+        else:
+            for c in range(1, TPL_COL_BRAND + 1):
+                ws.cell(row=r, column=c, value=None)
+
+        ws.cell(row=r, column=TPL_COL_SPEC1, value=spec)
+        ws.cell(row=r, column=TPL_COL_PRICE, value=_maybe_excel_number(price_s))
+        ws.cell(row=r, column=TPL_COL_STOCK, value=_maybe_excel_number(stock_s))
+        ws.cell(row=r, column=TPL_COL_SKU_BARCODE, value=bc_s or None)
+
+    wb.save(dest)
+
+
 def extension_from_url(url: str) -> str:
     try:
         suf = Path(urlparse(url).path).suffix.lower()
@@ -258,18 +351,6 @@ def sanitize_file_stem(name: str, max_len: int = MAX_SKU_NAME_STEM) -> str:
     s = sanitize_component(name, max_len)
     s = s.replace(" ", "_")
     return s
-
-
-def write_product_xlsx(dest: Path, headers: list[str], row: dict[str, str]) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "商品信息"
-    for col, h in enumerate(headers, start=1):
-        ws.cell(row=1, column=col, value=h)
-    for col, h in enumerate(headers, start=1):
-        v = row.get(h, "")
-        ws.cell(row=2, column=col, value="" if v is None else str(v))
-    wb.save(dest)
 
 
 def download_to_file(
@@ -342,6 +423,10 @@ def run_job(
     if "商品ID" not in headers or "商品名称" not in headers:
         return False, "CSV 缺少必需列：商品ID 或 商品名称。", ""
 
+    tpl_path = product_info_template_path()
+    if not tpl_path.is_file():
+        return False, f"缺少商品信息模板文件：{tpl_path}", ""
+
     main_cols = [f"主图{i}" for i in range(1, 6)]
 
     root_name = root_material_folder_name(csv_path.stem)
@@ -357,13 +442,20 @@ def run_job(
     on_log(f"素材包目录: {root_dir}")
 
     raw_row_count = len(rows)
-    effective_rows = [r for r in rows if row_has_product_id(r)]
-    skipped_empty_id = raw_row_count - len(effective_rows)
+    rows_with_id = [r for r in rows if row_has_product_id(r)]
+    skipped_empty_id = raw_row_count - len(rows_with_id)
+    effective_rows = [r for r in rows_with_id if row_has_skus(r)]
+    skipped_no_sku = len(rows_with_id) - len(effective_rows)
     total = len(effective_rows)
+    parts_summary: list[str] = []
     if skipped_empty_id:
+        parts_summary.append(f"{skipped_empty_id} 行商品ID 为空已忽略")
+    if skipped_no_sku:
+        parts_summary.append(f"{skipped_no_sku} 行 SKU属性 无有效分段已忽略")
+    if parts_summary:
         on_log(
-            f"CSV 共 {raw_row_count} 行数据，其中 {skipped_empty_id} 行商品ID 为空已忽略，"
-            f"有效 {total} 条，开始处理。"
+            f"CSV 共 {raw_row_count} 行数据，{', '.join(parts_summary)}，"
+            f"待处理 {total} 条，开始处理。"
         )
     else:
         on_log(f"共 {total} 条有效商品记录，开始处理。")
@@ -408,7 +500,7 @@ def run_job(
 
         xlsx_path = product_dir / "商品信息.xlsx"
         try:
-            write_product_xlsx(xlsx_path, headers, row)
+            write_product_xlsx_from_template(tpl_path, xlsx_path, row)
             on_log(f"[{idx}/{total}] 已写入 商品信息.xlsx（{folder}）")
         except Exception as e:
             on_log(f"[{idx}/{total}] 写入 xlsx 失败: {e}")
