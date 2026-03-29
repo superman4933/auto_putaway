@@ -12,6 +12,9 @@ import requests
 from charset_normalizer import from_bytes
 from openpyxl import Workbook
 
+OnLog = Callable[[str], None]
+OnProgress = Callable[[int, int], None]
+
 CSV_PROBE_BYTES = 256 * 1024
 
 FALLBACK_ENCODINGS: tuple[str, ...] = (
@@ -96,7 +99,23 @@ def load_csv_with_encoding_detection(
         detail += "…"
     raise ValueError(f"无法用已知编码解码 CSV。尝试摘要: {detail}")
 
-OnLog = Callable[[str], None]
+
+def row_has_product_id(row: dict[str, str]) -> bool:
+    return bool((row.get("商品ID") or "").strip())
+
+
+def get_csv_data_row_count(csv_path: Path) -> tuple[int | None, str | None]:
+    """统计有效数据行数：商品ID 非空（strip 后），不含表头。失败返回 (None, 错误说明)。"""
+    p = csv_path.resolve()
+    if not p.is_file():
+        return None, "文件不存在。"
+    try:
+        headers, rows, _enc = load_csv_with_encoding_detection(p, None)
+    except ValueError as e:
+        return None, str(e)
+    if "商品ID" not in headers or "商品名称" not in headers:
+        return None, "CSV 缺少必需列：商品ID 或 商品名称。"
+    return sum(1 for r in rows if row_has_product_id(r)), None
 
 WIN_ILLEGAL = r'<>:"/\\|?*'
 WIN_ILLEGAL_SET = set(WIN_ILLEGAL)
@@ -304,23 +323,24 @@ def run_job(
     output_base: Path,
     stop_event: threading.Event,
     on_log: OnLog,
-) -> tuple[bool, str]:
+    on_progress: OnProgress | None = None,
+) -> tuple[bool, str, str]:
     csv_path = csv_path.resolve()
     output_base = output_base.resolve()
     if not csv_path.is_file():
-        return False, "CSV 文件不存在。"
+        return False, "CSV 文件不存在。", ""
     if not output_base.is_dir():
-        return False, "输出目录无效。"
+        return False, "输出目录无效。", ""
 
     try:
         headers, rows, used_enc = load_csv_with_encoding_detection(csv_path, on_log)
     except ValueError as e:
-        return False, str(e)
+        return False, str(e), ""
 
     on_log(f"已使用编码读取 CSV: {used_enc}")
 
     if "商品ID" not in headers or "商品名称" not in headers:
-        return False, "CSV 缺少必需列：商品ID 或 商品名称。"
+        return False, "CSV 缺少必需列：商品ID 或 商品名称。", ""
 
     main_cols = [f"主图{i}" for i in range(1, 6)]
 
@@ -329,25 +349,40 @@ def run_job(
     try:
         root_dir.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
-        return False, f"素材包目录已存在（可能同一秒内重复运行）: {root_dir}"
+        return False, f"素材包目录已存在（可能同一秒内重复运行）: {root_dir}", ""
     except OSError as e:
-        return False, f"无法创建素材包目录: {e}"
+        return False, f"无法创建素材包目录: {e}", ""
 
+    material_root_str = str(root_dir)
     on_log(f"素材包目录: {root_dir}")
 
-    total = len(rows)
-    on_log(f"共 {total} 条商品记录，开始处理。")
+    raw_row_count = len(rows)
+    effective_rows = [r for r in rows if row_has_product_id(r)]
+    skipped_empty_id = raw_row_count - len(effective_rows)
+    total = len(effective_rows)
+    if skipped_empty_id:
+        on_log(
+            f"CSV 共 {raw_row_count} 行数据，其中 {skipped_empty_id} 行商品ID 为空已忽略，"
+            f"有效 {total} 条，开始处理。"
+        )
+    else:
+        on_log(f"共 {total} 条有效商品记录，开始处理。")
 
-    for idx, row in enumerate(rows, start=1):
+    if total == 0:
+        on_log("没有商品ID 非空的记录，无需处理。")
+        on_log("全部商品处理完成。")
+        return True, "完成", material_root_str
+
+    for idx, row in enumerate(effective_rows, start=1):
         if stop_event.is_set():
             on_log("已收到停止指令，结束任务（当前文件已写完）。")
-            return True, "已停止"
+            return True, "已停止", material_root_str
+
+        if on_progress is not None:
+            on_progress(idx, total)
 
         name = (row.get("商品名称") or "").strip()
         pid = (row.get("商品ID") or "").strip()
-        if not pid:
-            on_log(f"[{idx}/{total}] 跳过：缺少商品ID。")
-            continue
 
         folder = product_folder_name(name or "_", pid)
         product_dir = root_dir / folder
@@ -369,7 +404,7 @@ def run_job(
 
         if stop_event.is_set():
             on_log("已收到停止指令，结束任务。")
-            return True, "已停止"
+            return True, "已停止", material_root_str
 
         xlsx_path = product_dir / "商品信息.xlsx"
         try:
@@ -386,7 +421,7 @@ def run_job(
                 continue
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
             dest_stem = sub_main / col
             on_log(f"[{idx}/{total}] 下载 {col} …")
             ok = download_to_file(raw, dest_stem, stop_event, on_log, is_video=False)
@@ -394,14 +429,14 @@ def run_job(
                 on_log(f"[{idx}/{total}] {col} 完成")
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
 
         desc = row.get("商品描述图")
         imgs = extract_img_srcs(desc)
         for n, u in enumerate(imgs, start=1):
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
             stem = sub_detail / f"详情图_{n}"
             on_log(f"[{idx}/{total}] 下载 详情图_{n} …")
             ok = download_to_file(u, stem, stop_event, on_log, is_video=False)
@@ -409,7 +444,7 @@ def run_job(
                 on_log(f"[{idx}/{total}] 详情图_{n} 完成")
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
 
         urls_sku = split_pipe_field(row.get("SKU属性图"))
         names_sku = split_pipe_field(row.get("SKU属性"))
@@ -421,7 +456,7 @@ def run_job(
         for si, u in enumerate(urls_sku, start=1):
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
             if si <= len(names_sku) and names_sku[si - 1]:
                 stem_name = sanitize_file_stem(names_sku[si - 1])
                 if not stem_name:
@@ -435,13 +470,13 @@ def run_job(
                 on_log(f"[{idx}/{total}] SKU 图 {stem_name} 完成")
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
 
         vid = (row.get("商品视频") or "").strip()
         if vid:
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
             dest_stem = sub_video / "主图视频"
             on_log(f"[{idx}/{total}] 下载 商品视频 …")
             ok = download_to_file(vid, dest_stem, stop_event, on_log, is_video=True)
@@ -449,9 +484,9 @@ def run_job(
                 on_log(f"[{idx}/{total}] 主图视频 完成")
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
-                return True, "已停止"
+                return True, "已停止", material_root_str
 
         on_log(f"[{idx}/{total}] 商品处理完成：{folder}")
 
     on_log("全部商品处理完成。")
-    return True, "完成"
+    return True, "完成", material_root_str

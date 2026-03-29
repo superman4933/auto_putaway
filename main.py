@@ -5,8 +5,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QCloseEvent
+from PyQt5.QtCore import Qt, QThread, QUrl, pyqtSignal
+from PyQt5.QtGui import QDesktopServices, QFont, QCloseEvent
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -22,12 +22,20 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from putaway_worker import run_job
+from putaway_worker import get_csv_data_row_count, run_job
+
+
+def open_local_dir(path: Path) -> bool:
+    p = path.resolve()
+    if not p.is_dir():
+        return False
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
 
 
 class PutawayThread(QThread):
     log_message = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(bool, str, str)
 
     def __init__(self, csv_path: Path, output_dir: Path, stop_event: threading.Event) -> None:
         super().__init__()
@@ -39,20 +47,30 @@ class PutawayThread(QThread):
         def emit_log(text: str) -> None:
             self.log_message.emit(text)
 
+        def emit_progress(current: int, total: int) -> None:
+            self.progress.emit(current, total)
+
         try:
-            ok, msg = run_job(self._csv_path, self._output_dir, self._stop_event, emit_log)
-            self.finished.emit(ok, msg)
+            ok, msg, material_root = run_job(
+                self._csv_path,
+                self._output_dir,
+                self._stop_event,
+                emit_log,
+                emit_progress,
+            )
+            self.finished.emit(ok, msg, material_root)
         except Exception as e:
             self.log_message.emit(f"处理异常: {e}")
-            self.finished.emit(False, str(e))
+            self.finished.emit(False, str(e), "")
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("自动上架工具")
-        self.setMinimumSize(720, 520)
+        self.setMinimumSize(720, 560)
         self._csv_path: Path | None = None
+        self._total_rows: int | None = None
         self._is_running = False
         self._stop_event: threading.Event | None = None
         self._worker: PutawayThread | None = None
@@ -72,14 +90,25 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self.btn_pick_csv)
         root.addWidget(file_group)
 
+        stat_layout = QHBoxLayout()
+        self.lbl_pending = QLabel("待处理：— 条（商品ID 非空）")
+        self.lbl_progress = QLabel("当前处理：—")
+        stat_layout.addWidget(self.lbl_pending)
+        stat_layout.addStretch(1)
+        stat_layout.addWidget(self.lbl_progress)
+        root.addLayout(stat_layout)
+
         out_group = QGroupBox("输出目录")
         out_layout = QHBoxLayout(out_group)
         self.output_dir_edit = QLineEdit()
         self.output_dir_edit.setPlaceholderText("选择表格后将自动设为表格所在目录")
         self.btn_pick_out = QPushButton("浏览…")
         self.btn_pick_out.clicked.connect(self._on_pick_output_dir)
+        self.btn_open_out = QPushButton("打开输出文件夹")
+        self.btn_open_out.clicked.connect(self._on_open_output_dir)
         out_layout.addWidget(self.output_dir_edit, 1)
         out_layout.addWidget(self.btn_pick_out)
+        out_layout.addWidget(self.btn_open_out)
         root.addWidget(out_group)
 
         ctrl_layout = QHBoxLayout()
@@ -130,6 +159,21 @@ class MainWindow(QMainWindow):
         self.btn_start_stop.setText("停止" if busy else "开始")
         self.btn_start_stop.setEnabled(busy or self._csv_path is not None)
 
+    def _refresh_pending_count(self) -> None:
+        self._total_rows = None
+        self.lbl_pending.setText("待处理：— 条（商品ID 非空）")
+        self.lbl_progress.setText("当前处理：—")
+        if self._csv_path is None or not self._csv_path.is_file():
+            return
+        self.lbl_pending.setText("待处理：统计中…（商品ID 非空）")
+        QApplication.processEvents()
+        n, err = get_csv_data_row_count(self._csv_path)
+        if n is not None:
+            self._total_rows = n
+            self.lbl_pending.setText(f"待处理：{n} 条（商品ID 非空）")
+        else:
+            self.lbl_pending.setText(f"待处理：无法统计（{err or '未知错误'}）")
+
     def _on_pick_csv(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -149,6 +193,7 @@ class MainWindow(QMainWindow):
         self.output_dir_edit.setText(out_dir)
         self.append_log(f"已选择表格：{self._csv_path}")
         self.append_log(f"输出目录已设为：{out_dir}")
+        self._refresh_pending_count()
         if not self._is_running:
             self.btn_start_stop.setEnabled(True)
 
@@ -161,17 +206,56 @@ class MainWindow(QMainWindow):
         self.output_dir_edit.setText(path)
         self.append_log(f"输出目录已手动设为：{path}")
 
+    def _on_open_output_dir(self) -> None:
+        text = self.output_dir_edit.text().strip()
+        if not text:
+            QMessageBox.information(self, "提示", "请先设置输出目录。")
+            return
+        p = Path(text)
+        if not open_local_dir(p):
+            QMessageBox.warning(self, "提示", f"无法打开目录（路径不存在或无效）：\n{p}")
+
     def _on_worker_log(self, text: str) -> None:
         self.append_log(text)
 
-    def _on_worker_finished(self, ok: bool, msg: str) -> None:
+    def _on_worker_progress(self, current: int, total: int) -> None:
+        self.lbl_progress.setText(f"当前处理：{current}/{total}")
+
+    def _on_worker_finished(self, ok: bool, msg: str, material_root: str) -> None:
         self._worker = None
         self._stop_event = None
         self._set_busy(False)
-        if ok:
+
+        if ok and msg == "完成" and material_root:
+            total = self._total_rows if self._total_rows is not None else 0
+            if total > 0:
+                self.lbl_progress.setText(f"当前处理：{total}/{total}")
+            else:
+                self.lbl_progress.setText("当前处理：已完成")
             self.append_log(f"任务结束：{msg}")
+
+            box = QMessageBox(self)
+            box.setWindowTitle("完成")
+            box.setIcon(QMessageBox.Information)
+            box.setText("已完成所有处理。")
+            box.setStandardButtons(QMessageBox.Ok)
+            box.exec_()
+            out_text = self.output_dir_edit.text().strip()
+            if out_text:
+                outp = Path(out_text)
+                if not open_local_dir(outp):
+                    QMessageBox.warning(
+                        self,
+                        "提示",
+                        f"无法打开输出文件夹：\n{outp}",
+                    )
+            self.lbl_progress.setText("当前处理：—")
+        elif ok:
+            self.append_log(f"任务结束：{msg}")
+            self.lbl_progress.setText("当前处理：—")
         else:
             self.append_log(f"任务失败：{msg}")
+            self.lbl_progress.setText("当前处理：—")
             QMessageBox.warning(self, "任务失败", msg)
 
     def _on_start_stop(self) -> None:
@@ -184,9 +268,11 @@ class MainWindow(QMainWindow):
             if not out_path.is_dir():
                 QMessageBox.warning(self, "提示", "请选择有效的输出目录。")
                 return
+            self.lbl_progress.setText("当前处理：准备中…")
             self._stop_event = threading.Event()
             self._worker = PutawayThread(self._csv_path, out_path, self._stop_event)
             self._worker.log_message.connect(self._on_worker_log)
+            self._worker.progress.connect(self._on_worker_progress)
             self._worker.finished.connect(self._on_worker_finished)
             self._set_busy(True)
             self.append_log("开始处理表格…")
