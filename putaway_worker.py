@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+import csv
+import re
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
+from urllib.parse import urlparse
+
+import requests
+from charset_normalizer import from_bytes
+from openpyxl import Workbook
+
+CSV_PROBE_BYTES = 256 * 1024
+
+FALLBACK_ENCODINGS: tuple[str, ...] = (
+    "gb18030",
+    "gbk",
+    "cp936",
+    "big5",
+    "cp950",
+    "utf-16-le",
+    "utf-16-be",
+    "utf-16",
+)
+
+PREFERRED_UTF: tuple[str, ...] = ("utf-8-sig", "utf-8")
+
+
+def _normalize_enc_key(name: str) -> str:
+    return name.replace("_", "-").lower()
+
+
+def build_csv_encoding_candidates(sample: bytes) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(enc: str | None) -> None:
+        if not enc:
+            return
+        key = _normalize_enc_key(enc)
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(enc)
+
+    for enc in PREFERRED_UTF:
+        add(enc)
+
+    try:
+        matches = from_bytes(sample)
+        for i, m in enumerate(matches):
+            if i >= 6:
+                break
+            add(m.encoding)
+    except Exception:
+        pass
+
+    for enc in FALLBACK_ENCODINGS:
+        add(enc)
+
+    return ordered
+
+
+def load_csv_with_encoding_detection(
+    csv_path: Path,
+    on_log: OnLog | None = None,
+) -> tuple[list[str], list[dict[str, str]], str]:
+    size = csv_path.stat().st_size
+    if size == 0:
+        raise ValueError("CSV 文件为空。")
+    sample = csv_path.read_bytes()[: min(CSV_PROBE_BYTES, size)]
+    candidates = build_csv_encoding_candidates(sample)
+    if on_log:
+        on_log(f"CSV 编码候选（探测 + 回退）: {', '.join(candidates[:8])}{'…' if len(candidates) > 8 else ''}")
+
+    errors: list[str] = []
+    for enc in candidates:
+        try:
+            with open(csv_path, "r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f)
+                if not reader.fieldnames:
+                    errors.append(f"{enc}: 无表头")
+                    continue
+                headers = list(reader.fieldnames)
+                rows = list(reader)
+            return headers, rows, enc
+        except UnicodeDecodeError as e:
+            errors.append(f"{enc}: {e}")
+        except UnicodeError as e:
+            errors.append(f"{enc}: {e}")
+
+    detail = "; ".join(errors[:5])
+    if len(errors) > 5:
+        detail += "…"
+    raise ValueError(f"无法用已知编码解码 CSV。尝试摘要: {detail}")
+
+OnLog = Callable[[str], None]
+
+WIN_ILLEGAL = r'<>:"/\\|?*'
+WIN_ILLEGAL_SET = set(WIN_ILLEGAL)
+
+SESSION_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+}
+
+IMG_SRC_RE = re.compile(
+    r'<img[^>]+src\s*=\s*(["\'])(.*?)\1',
+    re.IGNORECASE | re.DOTALL,
+)
+
+PIPE_DELIM = "'|'"
+
+CONTENT_TYPE_EXT: dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-msvideo": ".avi",
+}
+
+VIDEO_EXTS = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".wmv"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif"}
+
+MAX_PRODUCT_FOLDER_LEN = 120
+MAX_STEM_SANITIZE = 200
+MAX_SKU_NAME_STEM = 80
+
+
+def sanitize_component(text: str, max_len: int) -> str:
+    if not text:
+        return ""
+    s = "".join("_" if c in WIN_ILLEGAL_SET or ord(c) < 32 else c for c in str(text).strip())
+    s = s.rstrip(" .")
+    if not s:
+        s = "_"
+    if len(s) > max_len:
+        s = s[:max_len].rstrip(" .") or "_"
+    upper = s.upper()
+    if upper in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2", "LPT3"}:
+        s = f"_{s}"
+    return s
+
+
+def product_folder_name(name: str, product_id: str) -> str:
+    id_part = sanitize_component(product_id, 40)
+    budget = MAX_PRODUCT_FOLDER_LEN - len(id_part) - 1
+    if budget < 1:
+        id_part = id_part[:20]
+        budget = MAX_PRODUCT_FOLDER_LEN - len(id_part) - 1
+    name_part = sanitize_component(name, min(budget, MAX_PRODUCT_FOLDER_LEN))
+    out = f"{name_part}_{id_part}"
+    if len(out) > MAX_PRODUCT_FOLDER_LEN:
+        out = out[:MAX_PRODUCT_FOLDER_LEN].rstrip("._ ") or "_"
+    return out
+
+
+def root_material_folder_name(csv_stem: str) -> str:
+    stem = sanitize_component(csv_stem, MAX_STEM_SANITIZE)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{stem}素材包{ts}"
+
+
+def split_pipe_field(value: str | None) -> list[str]:
+    if value is None:
+        return []
+    s = str(value).strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(PIPE_DELIM)]
+    return [p for p in parts if p]
+
+
+def extension_from_url(url: str) -> str:
+    try:
+        suf = Path(urlparse(url).path).suffix.lower()
+    except Exception:
+        return ""
+    if suf in IMAGE_EXTS or suf in VIDEO_EXTS:
+        return suf
+    if suf == ".jpe":
+        return ".jpg"
+    return ""
+
+
+def extension_from_content_type(ct: str | None) -> str:
+    if not ct:
+        return ""
+    base = ct.split(";")[0].strip().lower()
+    return CONTENT_TYPE_EXT.get(base, "")
+
+
+def pick_image_extension(url: str, content_type: str | None) -> str:
+    u = extension_from_url(url)
+    if u:
+        return u
+    c = extension_from_content_type(content_type)
+    if c:
+        return c
+    return ".jpg"
+
+
+def pick_video_extension(url: str, content_type: str | None) -> str:
+    u = extension_from_url(url)
+    if u and u in VIDEO_EXTS:
+        return u
+    c = extension_from_content_type(content_type)
+    if c and c in VIDEO_EXTS:
+        return c
+    if u:
+        return u
+    return ".mp4"
+
+
+def extract_img_srcs(html: str | None) -> list[str]:
+    if not html:
+        return []
+    out: list[str] = []
+    for m in IMG_SRC_RE.finditer(html):
+        src = (m.group(2) or "").strip()
+        if src.lower().startswith("http://") or src.lower().startswith("https://"):
+            out.append(src)
+    return out
+
+
+def sanitize_file_stem(name: str, max_len: int = MAX_SKU_NAME_STEM) -> str:
+    s = sanitize_component(name, max_len)
+    s = s.replace(" ", "_")
+    return s
+
+
+def write_product_xlsx(dest: Path, headers: list[str], row: dict[str, str]) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "商品信息"
+    for col, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=col, value=h)
+    for col, h in enumerate(headers, start=1):
+        v = row.get(h, "")
+        ws.cell(row=2, column=col, value="" if v is None else str(v))
+    wb.save(dest)
+
+
+def download_to_file(
+    url: str,
+    dest_without_ext: Path,
+    stop_event: threading.Event,
+    on_log: OnLog,
+    *,
+    is_video: bool,
+) -> bool:
+    if stop_event.is_set():
+        return False
+    last_err: str | None = None
+    for attempt in range(1, 4):
+        if stop_event.is_set():
+            return False
+        try:
+            with requests.get(
+                url,
+                timeout=30,
+                headers=SESSION_HEADERS,
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                ct = resp.headers.get("Content-Type")
+                ext = (
+                    pick_video_extension(url, ct)
+                    if is_video
+                    else pick_image_extension(url, ct)
+                )
+                final_path = dest_without_ext.with_suffix(ext)
+                tmp_path = final_path.with_name(final_path.name + ".part")
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                if final_path.exists():
+                    final_path.unlink()
+                tmp_path.replace(final_path)
+            return True
+        except Exception as e:
+            last_err = str(e)
+            on_log(f"下载失败（第 {attempt} 次）: {url[:80]}… — {e}")
+    if last_err:
+        on_log(f"已跳过（3 次均失败）: {url[:80]}…")
+    return False
+
+
+def run_job(
+    csv_path: Path,
+    output_base: Path,
+    stop_event: threading.Event,
+    on_log: OnLog,
+) -> tuple[bool, str]:
+    csv_path = csv_path.resolve()
+    output_base = output_base.resolve()
+    if not csv_path.is_file():
+        return False, "CSV 文件不存在。"
+    if not output_base.is_dir():
+        return False, "输出目录无效。"
+
+    try:
+        headers, rows, used_enc = load_csv_with_encoding_detection(csv_path, on_log)
+    except ValueError as e:
+        return False, str(e)
+
+    on_log(f"已使用编码读取 CSV: {used_enc}")
+
+    if "商品ID" not in headers or "商品名称" not in headers:
+        return False, "CSV 缺少必需列：商品ID 或 商品名称。"
+
+    main_cols = [f"主图{i}" for i in range(1, 6)]
+
+    root_name = root_material_folder_name(csv_path.stem)
+    root_dir = output_base / root_name
+    try:
+        root_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        return False, f"素材包目录已存在（可能同一秒内重复运行）: {root_dir}"
+    except OSError as e:
+        return False, f"无法创建素材包目录: {e}"
+
+    on_log(f"素材包目录: {root_dir}")
+
+    total = len(rows)
+    on_log(f"共 {total} 条商品记录，开始处理。")
+
+    for idx, row in enumerate(rows, start=1):
+        if stop_event.is_set():
+            on_log("已收到停止指令，结束任务（当前文件已写完）。")
+            return True, "已停止"
+
+        name = (row.get("商品名称") or "").strip()
+        pid = (row.get("商品ID") or "").strip()
+        if not pid:
+            on_log(f"[{idx}/{total}] 跳过：缺少商品ID。")
+            continue
+
+        folder = product_folder_name(name or "_", pid)
+        product_dir = root_dir / folder
+        try:
+            product_dir.mkdir(parents=False, exist_ok=False)
+        except FileExistsError:
+            on_log(f"[{idx}/{total}] 跳过：文件夹已存在 {folder}")
+            continue
+        except OSError as e:
+            on_log(f"[{idx}/{total}] 跳过：无法创建文件夹 {folder} — {e}")
+            continue
+
+        sub_main = product_dir / "主图"
+        sub_sku = product_dir / "SKU图"
+        sub_detail = product_dir / "详情图"
+        sub_video = product_dir / "主图视频"
+        for d in (sub_main, sub_sku, sub_detail, sub_video):
+            d.mkdir(parents=True, exist_ok=True)
+
+        if stop_event.is_set():
+            on_log("已收到停止指令，结束任务。")
+            return True, "已停止"
+
+        xlsx_path = product_dir / "商品信息.xlsx"
+        try:
+            write_product_xlsx(xlsx_path, headers, row)
+            on_log(f"[{idx}/{total}] 已写入 商品信息.xlsx（{folder}）")
+        except Exception as e:
+            on_log(f"[{idx}/{total}] 写入 xlsx 失败: {e}")
+
+        for col in main_cols:
+            if col not in row:
+                continue
+            raw = (row.get(col) or "").strip()
+            if not raw:
+                continue
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+            dest_stem = sub_main / col
+            on_log(f"[{idx}/{total}] 下载 {col} …")
+            ok = download_to_file(raw, dest_stem, stop_event, on_log, is_video=False)
+            if ok:
+                on_log(f"[{idx}/{total}] {col} 完成")
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+
+        desc = row.get("商品描述图")
+        imgs = extract_img_srcs(desc)
+        for n, u in enumerate(imgs, start=1):
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+            stem = sub_detail / f"详情图_{n}"
+            on_log(f"[{idx}/{total}] 下载 详情图_{n} …")
+            ok = download_to_file(u, stem, stop_event, on_log, is_video=False)
+            if ok:
+                on_log(f"[{idx}/{total}] 详情图_{n} 完成")
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+
+        urls_sku = split_pipe_field(row.get("SKU属性图"))
+        names_sku = split_pipe_field(row.get("SKU属性"))
+        if len(urls_sku) != len(names_sku):
+            on_log(
+                f"[{idx}/{total}] 提示：SKU属性图（{len(urls_sku)} 个）与 "
+                f"SKU属性（{len(names_sku)} 个）数量不一致，缺名将使用 SKU图_N。"
+            )
+        for si, u in enumerate(urls_sku, start=1):
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+            if si <= len(names_sku) and names_sku[si - 1]:
+                stem_name = sanitize_file_stem(names_sku[si - 1])
+                if not stem_name:
+                    stem_name = f"SKU图_{si}"
+            else:
+                stem_name = f"SKU图_{si}"
+            dest_stem = sub_sku / stem_name
+            on_log(f"[{idx}/{total}] 下载 SKU 图 ({stem_name}) …")
+            ok = download_to_file(u, dest_stem, stop_event, on_log, is_video=False)
+            if ok:
+                on_log(f"[{idx}/{total}] SKU 图 {stem_name} 完成")
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+
+        vid = (row.get("商品视频") or "").strip()
+        if vid:
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+            dest_stem = sub_video / "主图视频"
+            on_log(f"[{idx}/{total}] 下载 商品视频 …")
+            ok = download_to_file(vid, dest_stem, stop_event, on_log, is_video=True)
+            if ok:
+                on_log(f"[{idx}/{total}] 主图视频 完成")
+            if stop_event.is_set():
+                on_log("已收到停止指令，结束任务。")
+                return True, "已停止"
+
+        on_log(f"[{idx}/{total}] 商品处理完成：{folder}")
+
+    on_log("全部商品处理完成。")
+    return True, "完成"
