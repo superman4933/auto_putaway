@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 from charset_normalizer import from_bytes
-from openpyxl import load_workbook
+from openpyxl import Workbook
 
 OnLog = Callable[[str], None]
 OnProgress = Callable[[int, int], None]
@@ -208,7 +208,30 @@ def get_csv_data_row_count(csv_path: Path) -> tuple[int | None, str | None]:
     return sum(1 for r in rows if row_has_product_id(r) and row_has_skus(r)), None
 
 
-PRODUCT_INFO_TEMPLATE = "商品信息.xlsx"
+PRODUCT_INFO_HEADERS: tuple[str, ...] = (
+    "*标题",
+    "货号",
+    "商品属性",
+    "类目",
+    "品牌",
+    "规格1",
+    "规格2",
+    "*价格",
+    "库存",
+    "短标题",
+    "商家SKU",
+    "SKU商品条形码",
+    "SKU属性",
+    "无理由退货",
+    "支付方式限制",
+    "产地",
+    "发货地",
+    "商品条形码",
+    "商品毛重(公斤)",
+    "[包装]长(mm)",
+    "[包装]宽(mm)",
+    "[包装]高(mm)",
+)
 
 TPL_COL_TITLE = 1
 TPL_COL_HUOHAO = 2
@@ -219,10 +242,6 @@ TPL_COL_SPEC1 = 6
 TPL_COL_PRICE = 8
 TPL_COL_STOCK = 9
 TPL_COL_SKU_BARCODE = 12
-
-
-def product_info_template_path() -> Path:
-    return Path(__file__).resolve().parent / PRODUCT_INFO_TEMPLATE
 
 
 def format_product_attr_cell(raw: str | None) -> str:
@@ -251,13 +270,14 @@ def _maybe_excel_number(s: str) -> str | int | float:
         return t
 
 
-def write_product_xlsx_from_template(template_path: Path, dest: Path, row: dict[str, str]) -> None:
-    wb = load_workbook(template_path)
+def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
+    wb = Workbook()
     ws = wb.active
-    first_data_row = 3
-    if ws.max_row >= first_data_row:
-        ws.delete_rows(first_data_row, ws.max_row - first_data_row + 1)
+    ws.title = "商品信息"
+    for col, title in enumerate(PRODUCT_INFO_HEADERS, start=1):
+        ws.cell(row=1, column=col, value=title)
 
+    first_data_row = 2
     skus = split_pipe_field(row.get("SKU属性"))
     prices = split_pipe_field(row.get("SKU价格"))
     stocks = split_pipe_field(row.get("SKU库存"))
@@ -423,10 +443,6 @@ def run_job(
     if "商品ID" not in headers or "商品名称" not in headers:
         return False, "CSV 缺少必需列：商品ID 或 商品名称。", ""
 
-    tpl_path = product_info_template_path()
-    if not tpl_path.is_file():
-        return False, f"缺少商品信息模板文件：{tpl_path}", ""
-
     main_cols = [f"主图{i}" for i in range(1, 6)]
 
     root_name = root_material_folder_name(csv_path.stem)
@@ -500,7 +516,7 @@ def run_job(
 
         xlsx_path = product_dir / "商品信息.xlsx"
         try:
-            write_product_xlsx_from_template(tpl_path, xlsx_path, row)
+            write_product_xlsx(xlsx_path, row)
             on_log(f"[{idx}/{total}] 已写入 商品信息.xlsx（{folder}）")
         except Exception as e:
             on_log(f"[{idx}/{total}] 写入 xlsx 失败: {e}")
