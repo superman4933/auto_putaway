@@ -411,8 +411,8 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
 
         ws.cell(row=r, column=TPL_COL_SPEC1, value=spec1)
         ws.cell(row=r, column=TPL_COL_SPEC2, value=spec2 or None)
-        ws.cell(row=r, column=TPL_COL_PRICE, value=_maybe_excel_number(price_s))
-        ws.cell(row=r, column=TPL_COL_STOCK, value=_maybe_excel_number(stock_s))
+        ws.cell(row=r, column=TPL_COL_PRICE, value=price_s or None)
+        ws.cell(row=r, column=TPL_COL_STOCK, value=stock_s or None)
         ws.cell(row=r, column=TPL_COL_SHORT_TITLE, value=short_title)
         ws.cell(row=r, column=TPL_COL_MERCHANT_SKU, value=msku_s or None)
         ws.cell(row=r, column=TPL_COL_SKU_BARCODE, value=bc_s or None)
