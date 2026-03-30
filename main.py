@@ -296,8 +296,10 @@ TPL_COL_ATTR = 3
 TPL_COL_CATEGORY = 4
 TPL_COL_BRAND = 5
 TPL_COL_SPEC1 = 6
+TPL_COL_SPEC2 = 7
 TPL_COL_PRICE = 8
 TPL_COL_STOCK = 9
+TPL_COL_SHORT_TITLE = 10
 TPL_COL_MERCHANT_SKU = 11
 TPL_COL_SKU_BARCODE = 12
 
@@ -321,6 +323,25 @@ def format_category_for_template(raw: str | None) -> str:
     if not s:
         return ""
     return s.replace("-->", ">")
+
+
+def split_sku_spec(raw: str) -> tuple[str, str]:
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+    parts = [p.strip() for p in s.split(";") if p.strip()]
+    if len(parts) >= 2:
+        return parts[1], parts[0]
+    return s, ""
+
+
+def build_short_title(spec1: str, spec2: str, max_len: int = 15) -> str:
+    s = f"{(spec1 or '').strip()}{(spec2 or '').strip()}".strip()
+    if not s:
+        return "_"
+    if len(s) > max_len:
+        return s[:max_len]
+    return s
 
 
 def _maybe_excel_number(s: str) -> str | int | float:
@@ -358,7 +379,8 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
     n = len(skus)
     for i in range(n):
         r = first_data_row + i
-        spec = skus[i]
+        spec1, spec2 = split_sku_spec(skus[i])
+        short_title = build_short_title(spec1, spec2)
         price_s = prices[i] if i < len(prices) else ""
         stock_s = stocks[i] if i < len(stocks) else ""
         bc_s = barcodes[i] if i < len(barcodes) else ""
@@ -374,9 +396,11 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
             for c in range(1, TPL_COL_BRAND + 1):
                 ws.cell(row=r, column=c, value=None)
 
-        ws.cell(row=r, column=TPL_COL_SPEC1, value=spec)
+        ws.cell(row=r, column=TPL_COL_SPEC1, value=spec1)
+        ws.cell(row=r, column=TPL_COL_SPEC2, value=spec2 or None)
         ws.cell(row=r, column=TPL_COL_PRICE, value=_maybe_excel_number(price_s))
         ws.cell(row=r, column=TPL_COL_STOCK, value=_maybe_excel_number(stock_s))
+        ws.cell(row=r, column=TPL_COL_SHORT_TITLE, value=short_title)
         ws.cell(row=r, column=TPL_COL_MERCHANT_SKU, value=msku_s or None)
         ws.cell(row=r, column=TPL_COL_SKU_BARCODE, value=bc_s or None)
 
@@ -438,6 +462,20 @@ def extract_img_srcs(html: str | None) -> list[str]:
 def sanitize_file_stem(name: str, max_len: int = MAX_SKU_NAME_STEM) -> str:
     s = sanitize_component(name, max_len)
     s = s.replace(" ", "_")
+    return s
+
+
+def parse_sku_image_base_name(raw: str) -> str:
+    """从 SKU属性 子元素中提取 SKU图基础名。"""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    semicolon_count = s.count(";")
+    if semicolon_count == 1:
+        parts = [p.strip() for p in s.split(";")]
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    # 无分号或分号超过 1 个时，不做二次分割，直接使用原值
     return s
 
 
@@ -625,16 +663,21 @@ def run_job(
                 f"[{idx}/{total}] 提示：SKU属性图（{len(urls_sku)} 个）与 "
                 f"SKU属性（{len(names_sku)} 个）数量不一致，缺名将使用 SKU图_N。"
             )
+        sku_name_counter: dict[str, int] = {}
         for si, u in enumerate(urls_sku, start=1):
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
                 return True, "已停止", material_root_str
             if si <= len(names_sku) and names_sku[si - 1]:
-                stem_name = sanitize_file_stem(names_sku[si - 1])
-                if not stem_name:
-                    stem_name = f"SKU图_{si}"
+                base_raw = parse_sku_image_base_name(names_sku[si - 1])
+                base_name = sanitize_file_stem(base_raw)
+                if not base_name:
+                    base_name = "SKU图"
             else:
-                stem_name = f"SKU图_{si}"
+                base_name = "SKU图"
+            next_no = sku_name_counter.get(base_name, 0) + 1
+            sku_name_counter[base_name] = next_no
+            stem_name = f"{base_name}_{next_no}"
             dest_stem = sub_sku / stem_name
             on_log(f"[{idx}/{total}] 下载 SKU 图 ({stem_name}) …")
             ok = download_to_file(u, dest_stem, stop_event, on_log, is_video=False)
