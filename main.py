@@ -298,6 +298,7 @@ TPL_COL_BRAND = 5
 TPL_COL_SPEC1 = 6
 TPL_COL_PRICE = 8
 TPL_COL_STOCK = 9
+TPL_COL_MERCHANT_SKU = 11
 TPL_COL_SKU_BARCODE = 12
 
 
@@ -313,6 +314,13 @@ def format_product_attr_cell(raw: str | None) -> str:
         return s
     parts = [f"{k}: {str(v)}" for k, v in obj.items()]
     return ", ".join(parts)
+
+
+def format_category_for_template(raw: str | None) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    return s.replace("-->", ">")
 
 
 def _maybe_excel_number(s: str) -> str | int | float:
@@ -339,11 +347,12 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
     prices = split_pipe_field(row.get("SKU价格"))
     stocks = split_pipe_field(row.get("SKU库存"))
     barcodes = split_pipe_field(row.get("SKU条形码"))
+    merchant_skus = split_pipe_field(row.get("SKU 商家编码"))
 
     title = (row.get("商品名称") or "").strip()
     huohao = (row.get("商品ID") or "").strip()
     attr_text = format_product_attr_cell(row.get("商品属性"))
-    category = (row.get("店铺分类") or "").strip()
+    category = format_category_for_template(row.get("商品分类"))
     brand = "无"
 
     n = len(skus)
@@ -353,6 +362,7 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
         price_s = prices[i] if i < len(prices) else ""
         stock_s = stocks[i] if i < len(stocks) else ""
         bc_s = barcodes[i] if i < len(barcodes) else ""
+        msku_s = merchant_skus[i] if i < len(merchant_skus) else ""
 
         if i == 0:
             ws.cell(row=r, column=TPL_COL_TITLE, value=title)
@@ -367,6 +377,7 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
         ws.cell(row=r, column=TPL_COL_SPEC1, value=spec)
         ws.cell(row=r, column=TPL_COL_PRICE, value=_maybe_excel_number(price_s))
         ws.cell(row=r, column=TPL_COL_STOCK, value=_maybe_excel_number(stock_s))
+        ws.cell(row=r, column=TPL_COL_MERCHANT_SKU, value=msku_s or None)
         ws.cell(row=r, column=TPL_COL_SKU_BARCODE, value=bc_s or None)
 
     wb.save(dest)
@@ -441,11 +452,13 @@ def download_to_file(
     if stop_event.is_set():
         return False
     last_err: str | None = None
+    session = requests.Session()
+    session.trust_env = False
     for attempt in range(1, 4):
         if stop_event.is_set():
             return False
         try:
-            with requests.get(
+            with session.get(
                 url,
                 timeout=30,
                 headers=SESSION_HEADERS,
@@ -572,7 +585,7 @@ def run_job(
         except Exception as e:
             on_log(f"[{idx}/{total}] 写入 xlsx 失败: {e}")
 
-        for col in main_cols:
+        for mi, col in enumerate(main_cols, start=1):
             if col not in row:
                 continue
             raw = (row.get(col) or "").strip()
@@ -581,11 +594,11 @@ def run_job(
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
                 return True, "已停止", material_root_str
-            dest_stem = sub_main / col
-            on_log(f"[{idx}/{total}] 下载 {col} …")
+            dest_stem = sub_main / f"主图_{mi}"
+            on_log(f"[{idx}/{total}] 下载 主图_{mi} …")
             ok = download_to_file(raw, dest_stem, stop_event, on_log, is_video=False)
             if ok:
-                on_log(f"[{idx}/{total}] {col} 完成")
+                on_log(f"[{idx}/{total}] 主图_{mi} 完成")
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
                 return True, "已停止", material_root_str
@@ -861,19 +874,20 @@ class MainWindow(QMainWindow):
             self.append_log(f"任务结束：{msg}")
 
             box = QMessageBox(self)
-            box.setWindowTitle("打开文件夹")
+            box.setWindowTitle("完成")
             box.setIcon(QMessageBox.Information)
             box.setText("已完成所有处理。")
-            box.setStandardButtons(QMessageBox.Ok)
+            btn_open = box.addButton("打开文件夹", QMessageBox.AcceptRole)
+            box.addButton("取消", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_open)
             box.exec_()
-            out_text = self.output_dir_edit.text().strip()
-            if out_text:
-                outp = Path(out_text)
-                if not open_local_dir(outp):
+            if box.clickedButton() == btn_open:
+                rootp = Path(material_root)
+                if not open_local_dir(rootp):
                     QMessageBox.warning(
                         self,
                         "提示",
-                        f"无法打开输出文件夹：\n{outp}",
+                        f"无法打开素材包文件夹：\n{rootp}",
                     )
             self.lbl_progress.setText("当前处理：—")
         elif ok:
