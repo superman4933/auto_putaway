@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
 
 OnLog = Callable[[str], None]
 OnProgress = Callable[[int, int], None]
+OnMaterialRoot = Callable[[str], None]
 
 CSV_PROBE_BYTES = 256 * 1024
 
@@ -545,6 +546,7 @@ def run_job(
     stop_event: threading.Event,
     on_log: OnLog,
     on_progress: OnProgress | None = None,
+    on_material_root: OnMaterialRoot | None = None,
 ) -> tuple[bool, str, str]:
     csv_path = csv_path.resolve()
     output_base = output_base.resolve()
@@ -576,6 +578,8 @@ def run_job(
 
     material_root_str = str(root_dir)
     on_log(f"素材包目录: {root_dir}")
+    if on_material_root is not None:
+        on_material_root(material_root_str)
 
     raw_row_count = len(rows)
     rows_with_id = [r for r in rows if row_has_product_id(r)]
@@ -741,6 +745,7 @@ def open_local_dir(path: Path) -> bool:
 class PutawayThread(QThread):
     log_message = pyqtSignal(str)
     progress = pyqtSignal(int, int)
+    material_root_created = pyqtSignal(str)
     finished = pyqtSignal(bool, str, str)
 
     def __init__(self, csv_path: Path, output_dir: Path, stop_event: threading.Event) -> None:
@@ -756,6 +761,9 @@ class PutawayThread(QThread):
         def emit_progress(current: int, total: int) -> None:
             self.progress.emit(current, total)
 
+        def emit_material_root(path: str) -> None:
+            self.material_root_created.emit(path)
+
         try:
             ok, msg, material_root = run_job(
                 self._csv_path,
@@ -763,6 +771,7 @@ class PutawayThread(QThread):
                 self._stop_event,
                 emit_log,
                 emit_progress,
+                emit_material_root,
             )
             self.finished.emit(ok, msg, material_root)
         except Exception as e:
@@ -780,6 +789,7 @@ class MainWindow(QMainWindow):
         self._is_running = False
         self._stop_event: threading.Event | None = None
         self._worker: PutawayThread | None = None
+        self._last_material_root: Path | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -913,11 +923,14 @@ class MainWindow(QMainWindow):
         self.append_log(f"输出目录已手动设为：{path}")
 
     def _on_open_output_dir(self) -> None:
-        text = self.output_dir_edit.text().strip()
-        if not text:
-            QMessageBox.information(self, "提示", "请先设置输出目录。")
-            return
-        p = Path(text)
+        if self._last_material_root is not None and self._last_material_root.is_dir():
+            p = self._last_material_root
+        else:
+            text = self.output_dir_edit.text().strip()
+            if not text:
+                QMessageBox.information(self, "提示", "请先设置输出目录。")
+                return
+            p = Path(text)
         if not open_local_dir(p):
             QMessageBox.warning(self, "提示", f"无法打开目录（路径不存在或无效）：\n{p}")
 
@@ -927,12 +940,16 @@ class MainWindow(QMainWindow):
     def _on_worker_progress(self, current: int, total: int) -> None:
         self.lbl_progress.setText(f"当前处理：{current}/{total}")
 
+    def _on_material_root_created(self, material_root: str) -> None:
+        self._last_material_root = Path(material_root)
+
     def _on_worker_finished(self, ok: bool, msg: str, material_root: str) -> None:
         self._worker = None
         self._stop_event = None
         self._set_busy(False)
 
         if ok and msg == "完成" and material_root:
+            self._last_material_root = Path(material_root)
             total = self._total_rows if self._total_rows is not None else 0
             if total > 0:
                 self.lbl_progress.setText(f"当前处理：{total}/{total}")
@@ -977,9 +994,11 @@ class MainWindow(QMainWindow):
                 return
             self.lbl_progress.setText("当前处理：准备中…")
             self._stop_event = threading.Event()
+            self._last_material_root = None
             self._worker = PutawayThread(self._csv_path, out_path, self._stop_event)
             self._worker.log_message.connect(self._on_worker_log)
             self._worker.progress.connect(self._on_worker_progress)
+            self._worker.material_root_created.connect(self._on_material_root_created)
             self._worker.finished.connect(self._on_worker_finished)
             self._set_busy(True)
             self.append_log("开始处理表格…")
