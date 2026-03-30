@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 import requests
 from charset_normalizer import from_bytes
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 
 from PyQt5.QtCore import Qt, QThread, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices, QFont, QCloseEvent
@@ -369,14 +371,80 @@ def _maybe_excel_number(s: str) -> str | int | float:
         return t
 
 
+TEMPLATE_COL_WIDTHS: dict[int, float] = {
+    1: 44.8416666666667,
+    2: 8.875,
+    3: 36.0,
+    4: 35.0,
+    5: 18.0333333333333,
+    6: 13.875,
+    7: 15.625,
+    8: 12.875,
+    9: 9.0,
+    10: 11.6,
+    11: 9.875,
+    12: 16.425,
+    13: 36.0666666666667,
+    14: 17.75,
+    15: 16.0,
+    16: 17.9583333333333,
+    17: 13.25,
+    18: 21.8083333333333,
+    19: 16.625,
+    20: 13.0,
+    21: 13.0,
+    22: 13.0,
+}
+
+
+def setup_product_sheet(ws) -> int:
+    ws.title = "商品信息"
+
+    for col, width in TEMPLATE_COL_WIDTHS.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    ws.row_dimensions[1].height = 134.0
+    ws.row_dimensions[2].height = 17.25
+
+    ws.merge_cells("A1:D1")
+    ws["A1"].value = (
+        "注意事项\n"
+        "1.注意：某些平台规则较严，请不要填写违规商品，不要填写重复信息。\n"
+        "2.同一商品多条SKU，SKU信息（需要填的价格、库存）按行填写；SPU信息只需填写一行即可（如类目）。\n"
+        "3.主图、SKU图、详情图通过上传图片的方式上传，素材包上传格式请看“素材包使用教程.docx”。\n"
+        "4.带*字段为必填项，漏填将上传失败。\n"
+        "5.类目和发货地需要按平台的格式填写，否则无法匹配（可在商家端过程中编辑）。\n"
+        "6.[包装]字段默认单位为毫米，可为小数。\n"
+        "7.属性格式：属性名:属性值；多个值用逗号分隔。"
+    )
+    ws["A1"].font = Font(name="微软雅黑", size=11, bold=True, color="FFFF0000")
+    ws["A1"].alignment = Alignment(
+        horizontal="left",
+        vertical="top",
+        wrap_text=True,
+    )
+
+    header_font = Font(name="微软雅黑", size=12, color="FF000000")
+    header_font_required = Font(name="微软雅黑", size=12, color="FFFF0000")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for col, title in enumerate(PRODUCT_INFO_HEADERS, start=1):
+        cell = ws.cell(row=2, column=col, value=title)
+        cell.font = header_font_required if str(title).startswith("*") else header_font
+        cell.alignment = header_alignment
+
+    # 条码类字段按文本处理，避免科学计数法/丢前导 0
+    ws.cell(row=2, column=TPL_COL_SKU_BARCODE).number_format = "@"
+    ws.cell(row=2, column=18).number_format = "@"
+
+    return 3
+
+
 def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
     wb = Workbook()
     ws = wb.active
-    ws.title = "商品信息"
-    for col, title in enumerate(PRODUCT_INFO_HEADERS, start=1):
-        ws.cell(row=1, column=col, value=title)
+    first_data_row = setup_product_sheet(ws)
 
-    first_data_row = 2
     skus = split_pipe_field(row.get("SKU属性"))
     prices = split_pipe_field(row.get("SKU价格"))
     stocks = split_pipe_field(row.get("SKU库存"))
@@ -392,6 +460,8 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
     valid_indices = get_valid_sku_indices(row)
     for out_i, src_i in enumerate(valid_indices):
         r = first_data_row + out_i
+        ws.row_dimensions[r].height = 45.0
+
         spec1, spec2 = split_sku_spec(skus[src_i])
         short_title = build_short_title(spec1, spec2)
         price_s = prices[src_i] if src_i < len(prices) else ""
@@ -416,6 +486,7 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
         ws.cell(row=r, column=TPL_COL_SHORT_TITLE, value=short_title)
         ws.cell(row=r, column=TPL_COL_MERCHANT_SKU, value=msku_s or None)
         ws.cell(row=r, column=TPL_COL_SKU_BARCODE, value=bc_s or None)
+        ws.cell(row=r, column=TPL_COL_SKU_BARCODE).number_format = "@"
 
     wb.save(dest)
 
