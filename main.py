@@ -247,8 +247,20 @@ def row_has_product_id(row: dict[str, str]) -> bool:
     return bool((row.get("商品ID") or "").strip())
 
 
+def get_valid_sku_indices(row: dict[str, str]) -> list[int]:
+    """过滤 SKU属性 中与商品名称完全相等（去首尾空格后）的脏元素。"""
+    product_name = (row.get("商品名称") or "").strip()
+    skus = split_pipe_field(row.get("SKU属性"))
+    out: list[int] = []
+    for i, sku in enumerate(skus):
+        if sku.strip() == product_name:
+            continue
+        out.append(i)
+    return out
+
+
 def row_has_skus(row: dict[str, str]) -> bool:
-    return len(split_pipe_field(row.get("SKU属性"))) > 0
+    return len(get_valid_sku_indices(row)) > 0
 
 
 def get_csv_data_row_count(csv_path: Path) -> tuple[int | None, str | None]:
@@ -376,17 +388,17 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
     category = format_category_for_template(row.get("商品分类"))
     brand = "无"
 
-    n = len(skus)
-    for i in range(n):
-        r = first_data_row + i
-        spec1, spec2 = split_sku_spec(skus[i])
+    valid_indices = get_valid_sku_indices(row)
+    for out_i, src_i in enumerate(valid_indices):
+        r = first_data_row + out_i
+        spec1, spec2 = split_sku_spec(skus[src_i])
         short_title = build_short_title(spec1, spec2)
-        price_s = prices[i] if i < len(prices) else ""
-        stock_s = stocks[i] if i < len(stocks) else ""
-        bc_s = barcodes[i] if i < len(barcodes) else ""
-        msku_s = merchant_skus[i] if i < len(merchant_skus) else ""
+        price_s = prices[src_i] if src_i < len(prices) else ""
+        stock_s = stocks[src_i] if src_i < len(stocks) else ""
+        bc_s = barcodes[src_i] if src_i < len(barcodes) else ""
+        msku_s = merchant_skus[src_i] if src_i < len(merchant_skus) else ""
 
-        if i == 0:
+        if out_i == 0:
             ws.cell(row=r, column=TPL_COL_TITLE, value=title)
             ws.cell(row=r, column=TPL_COL_HUOHAO, value=huohao)
             ws.cell(row=r, column=TPL_COL_ATTR, value=attr_text)
@@ -658,18 +670,30 @@ def run_job(
 
         urls_sku = split_pipe_field(row.get("SKU属性图"))
         names_sku = split_pipe_field(row.get("SKU属性"))
+        valid_sku_indices = get_valid_sku_indices(row)
+        filtered_sku_names = [
+            names_sku[i] for i in valid_sku_indices if i < len(names_sku)
+        ]
+        filtered_sku_urls = [
+            urls_sku[i] for i in valid_sku_indices if i < len(urls_sku)
+        ]
         if len(urls_sku) != len(names_sku):
             on_log(
                 f"[{idx}/{total}] 提示：SKU属性图（{len(urls_sku)} 个）与 "
                 f"SKU属性（{len(names_sku)} 个）数量不一致，缺名将使用 SKU图_N。"
             )
+        dropped_dirty = len(names_sku) - len(filtered_sku_names)
+        if dropped_dirty > 0:
+            on_log(
+                f"[{idx}/{total}] 已过滤 SKU属性 脏数据 {dropped_dirty} 个（与商品名称相同）。"
+            )
         sku_name_counter: dict[str, int] = {}
-        for si, u in enumerate(urls_sku, start=1):
+        for si, u in enumerate(filtered_sku_urls, start=1):
             if stop_event.is_set():
                 on_log("已收到停止指令，结束任务。")
                 return True, "已停止", material_root_str
-            if si <= len(names_sku) and names_sku[si - 1]:
-                base_raw = parse_sku_image_base_name(names_sku[si - 1])
+            if si <= len(filtered_sku_names) and filtered_sku_names[si - 1]:
+                base_raw = parse_sku_image_base_name(filtered_sku_names[si - 1])
                 base_name = sanitize_file_stem(base_raw)
                 if not base_name:
                     base_name = "SKU图"
