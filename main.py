@@ -440,7 +440,32 @@ def setup_product_sheet(ws) -> int:
     return 3
 
 
-def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
+def _row_has_spec2(row: dict[str, str], on_log: OnLog | None = None) -> bool:
+    skus = split_pipe_field(row.get("SKU属性"))
+    valid_indices = get_valid_sku_indices(row)
+    for i in valid_indices:
+        if i >= len(skus):
+            continue
+        spec1, spec2 = split_sku_spec(skus[i])
+        if spec2:
+            if on_log is not None:
+                pid = (row.get("商品ID") or "").strip()
+                name = (row.get("商品名称") or "").strip()
+                on_log(
+                    "检测到规格2（按商品判断）："
+                    f"商品ID={pid or '_'}，商品名称={name or '_'}，"
+                    f"SKU段={skus[i]!r} -> 规格1={spec1!r} 规格2={spec2!r}"
+                )
+            return True
+    return False
+
+
+def write_product_xlsx(
+    dest: Path,
+    row: dict[str, str],
+    *,
+    has_spec2: bool,
+) -> None:
     wb = Workbook()
     ws = wb.active
     first_data_row = setup_product_sheet(ws)
@@ -480,7 +505,11 @@ def write_product_xlsx(dest: Path, row: dict[str, str]) -> None:
                 ws.cell(row=r, column=c, value=None)
 
         ws.cell(row=r, column=TPL_COL_SPEC1, value=spec1)
-        ws.cell(row=r, column=TPL_COL_SPEC2, value=spec2 or None)
+        ws.cell(
+            row=r,
+            column=TPL_COL_SPEC2,
+            value=spec2 if spec2 else ("*" if has_spec2 else None),
+        )
         ws.cell(row=r, column=TPL_COL_PRICE, value=price_s or None)
         ws.cell(row=r, column=TPL_COL_STOCK, value=stock_s or None)
         ws.cell(row=r, column=TPL_COL_SHORT_TITLE, value=short_title)
@@ -705,7 +734,8 @@ def run_job(
 
         xlsx_path = product_dir / "商品信息.xlsx"
         try:
-            write_product_xlsx(xlsx_path, row)
+            has_spec2 = _row_has_spec2(row, on_log)
+            write_product_xlsx(xlsx_path, row, has_spec2=has_spec2)
             on_log(f"[{idx}/{total}] 已写入 商品信息.xlsx（{folder}）")
         except Exception as e:
             on_log(f"[{idx}/{total}] 写入 xlsx 失败: {e}")
