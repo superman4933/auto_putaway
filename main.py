@@ -483,7 +483,12 @@ def write_product_xlsx(
     brand = "无"
 
     valid_indices = get_valid_sku_indices(row)
-    for out_i, src_i in enumerate(valid_indices):
+    # 按规格1排序写入，确保同规格1相邻；排序对象为索引，保证整行字段关联不变
+    sorted_indices = sorted(
+        valid_indices,
+        key=lambda i: split_sku_spec(skus[i])[0] if i < len(skus) else "",
+    )
+    for out_i, src_i in enumerate(sorted_indices):
         r = first_data_row + out_i
         ws.row_dimensions[r].height = 45.0
 
